@@ -13,12 +13,25 @@ accessed later after being created. If a static variable changes throughout the
 lifetime of the program then Rust can't guarantee you won't have different
 results.
 
-That being said there are times where it might be useful, usually when dealing
-with C libraries. I came onto this issue of creating uninitialized statics
-recently while using the context switching functions from `libc`. I wanted to
-get the hang of them by just doing a one to one port of C and later making
-a more Rust like interface for my library some other time. The code I was
-porting came from
+If you need things to be static but immutable and the only way to initialize
+them is through non constant functions I would highly recommend the
+`lazy_static` crate. It allows you to create things like `HashMap`s and things
+where you already know everything that will be in them and won't change. You can
+see some examples on it's repo
+[here](https://github.com/rust-lang-nursery/lazy-static.rs). Generally you could
+use this and a value wrapped in a `Mutex` in order to [have mutability with
+statics](https://github.com/rust-lang-nursery/lazy-static.rs/issues/39).
+Sometimes though that doesn't work. I couldn't use this crate this time since
+`ucontext_t` is not `Send` because it has raw pointers in it's fields. When we
+don't use don't use a `Mutex` here that `Send` restriction is gone. Instead we
+use `static mut` which as mentioned before is `unsafe`.
+
+That being said there are times where having an uninitialized global static
+might be useful, usually when dealing with C libraries. I came onto this issue
+of creating uninitialized statics recently while using the context switching
+functions from `libc`. I wanted to get the hang of them by just doing a one to
+one port of C and later making a more Rust like interface for my library some
+other time. The code I was porting came from
 [this](http://pubs.opengroup.org/onlinepubs/009695399/functions/makecontext.html)
 site and was an example of how the `makecontext` function worked. Here's the
 code I ended coming up with to get it all working:
@@ -29,6 +42,9 @@ extern crate libc;
 use libc::{c_char, swapcontext, makecontext, getcontext, ucontext_t, c_void};
 use std::mem;
 
+// All of the uninitialized context types we'll need later, where a context is
+// a point in the code we can swap back to with all of the registers and values
+// restored as if we had never jumped to some other point in the code.
 static mut CTX_0: Option<ucontext_t> = None;
 static mut CTX_1: Option<ucontext_t> = None;
 static mut CTX_2: Option<ucontext_t> = None;
@@ -37,21 +53,40 @@ pub fn main() {
     println!("Start Main");
     unsafe {
 
+        // We need empty arrays for the context types later. These act as a
+        // stack to store values
         let mut st1: [c_char; 8192] = [mem::zeroed(); 8192];
         let mut st2: [c_char; 8192] = [mem::zeroed(); 8192];
 
         // This code could be done without this variable but I wanted
-        // to make it close to the port
+        // to make it close to the port. Think of it as a context that
+        // doesn't point to anywhere, allowing us to come back to where
+        // we left off later.
         CTX_0 = Some(mem::uninitialized());
 
+        // We're creating an empty context here.
         let mut ctx_1_tmp: ucontext_t = mem::uninitialized();
+
+        // We pass the raw pointer to the context to initialize it
         getcontext(&mut ctx_1_tmp as *mut ucontext_t);
+
+        // We now assign it to the global static
         CTX_1 = Some(ctx_1_tmp);
+
+        // We set up a stack for registers and keeping track of stuff
+        // As well as the size of the stack.
         ctx_1().uc_stack.ss_sp = st1.as_mut_ptr() as *mut c_void;
         ctx_1().uc_stack.ss_size = mem::size_of_val(&st1);
+
+        // Once we finish with this part of the code where do we go next?
         ctx_1().uc_link = ctx_0() as *mut ucontext_t;
+
+        // We now point the context to a specific function. In this case the
+        // function f1
         makecontext(ctx_1() as *mut ucontext_t, f1, 0);
 
+        // This part is much like before except we have a different stack and
+        // have it go to CTX_1 after completion rather than CTX_0
         let mut ctx_2_tmp: ucontext_t = mem::uninitialized();
         getcontext(&mut ctx_2_tmp as *mut ucontext_t);
         CTX_2 = Some(ctx_2_tmp);
@@ -60,35 +95,44 @@ pub fn main() {
         ctx_2().uc_link = ctx_1() as *mut ucontext_t;
         makecontext(ctx_2() as *mut ucontext_t, f2, 0);
 
+        // Now we start by going from where we're at to whatever CTX_2 points to
+        // in this case that's the function f2
         swapcontext(ctx_0() as *mut ucontext_t, ctx_2() as *const ucontext_t);
     }
     println!("Finished Main");
 }
 
+// The function given for CTX_1
 extern "C" fn f1() {
     println!("Start f1");
     unsafe { swapcontext(ctx_1() as *mut ucontext_t, ctx_2() as *const ucontext_t)};
     println!("Finish f1");
 }
 
+// The function given for CTX_2
 extern "C" fn f2() {
     println!("Start f2");
     unsafe { swapcontext(ctx_2() as *mut ucontext_t, ctx_1() as *const ucontext_t)};
     println!("Finish f2");
 }
 
+// Convenience function to access the variable inside CTX_0
 unsafe fn ctx_0() -> &'static mut ucontext_t {
     match CTX_0 {
         Some(ref mut x) => &mut *x,
         None => panic!(),
     }
 }
+
+// Convenience function to access the variable inside CTX_1
 unsafe fn ctx_1() -> &'static mut ucontext_t {
     match CTX_1 {
         Some(ref mut x) => &mut *x,
         None => panic!(),
     }
 }
+
+// Convenience function to access the variable inside CTX_2
 unsafe fn ctx_2() -> &'static mut ucontext_t {
     match CTX_2 {
         Some(ref mut x) => &mut *x,
@@ -108,10 +152,13 @@ Finish f1
 Finish Main
 ```
 
-Control flow goes all over the place but it has it's place for things like
-coroutines. However this code is an example for something else that I didn't
-find documented specifically anywhere and had to be pulled from disparate
-information sources. Let's take a look at the important bits:
+This might be a bit confusing since the control flow goes all over the place but
+it has its place for things like coroutines. However this code is an example for
+uninitialized global statics in Rust something that I didn't find documented
+specifically anywhere and had to be pulled from disparate information sources.
+If you don't care or understand about the context switching that's okay!
+Let's take a look at the important bits above so you can understand how to do
+what I described:
 
 ```rust
 static mut CTX_0: Option<ucontext_t> = None;
@@ -120,7 +167,7 @@ static mut CTX_2: Option<ucontext_t> = None;
 ```
 
 Here we're declaring our variables and assigning them a value of `None`. This
-satisfies the constraints for statics in Rust. They need a value at
+satisfies the constraints for statics in Rust. They need an initial value at
 compile time. We use `Option` in Rust to represent the possibility of a value
 existing. Here we assign it a value of `None` to let the compiler know that
 there is no value right now! This will change later but the compiler trusts
